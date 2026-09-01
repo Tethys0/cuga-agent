@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -55,6 +56,12 @@ class MemoryMetadataPatchRequest(BaseModel):
 
 class MemoryAccessRequest(BaseModel):
     entity_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class RetentionRunRequest(BaseModel):
+    dry_run: bool = True
+    as_of: Optional[str] = None
+    scan_limit: Optional[int] = Field(default=None, ge=1, le=100_000)
 
 
 def _user_id(current_user: Optional[UserInfo]) -> str:
@@ -418,3 +425,106 @@ async def patch_admin_memory_entity(
         )
     )
     return JSONResponse(_project_item(result, audience="admin", include_content=False))
+
+
+@router.get("/memory/retention")
+async def get_user_memory_retention(
+    current_user: Optional[UserInfo] = Depends(require_chat_access),
+):
+    from cuga.backend.evolve.retention import retention_capabilities
+
+    status = await EvolveIntegration.get_compliance_status(namespace_id=_namespace_id())
+    return JSONResponse(
+        retention_capabilities(retention_available=bool(status and status.get("retention_available")))
+    )
+
+
+@router.get("/manage/memory/retention")
+async def get_admin_memory_retention(
+    current_user: Optional[UserInfo] = Depends(require_manage_access),
+):
+    from cuga.backend.evolve.retention import retention_capabilities
+
+    status = await EvolveIntegration.get_compliance_status(namespace_id=_namespace_id())
+    return JSONResponse(
+        retention_capabilities(retention_available=bool(status and status.get("retention_available")))
+    )
+
+
+@router.post("/manage/memory/retention/validate")
+async def validate_admin_retention_policy(
+    current_user: Optional[UserInfo] = Depends(require_manage_access),
+):
+    from cuga.backend.evolve.retention import DEFAULT_RETENTION_POLICY
+
+    result = _memory_result(await EvolveIntegration.validate_retention_policy(DEFAULT_RETENTION_POLICY))
+    return JSONResponse(
+        {key: result[key] for key in ("valid", "errors", "warnings", "normalized_policy") if key in result}
+    )
+
+
+@router.post("/manage/memory/retention/runs")
+async def run_admin_memory_retention(
+    body: RetentionRunRequest,
+    agent_id: str = Query(default="cuga-default", min_length=1, max_length=200),
+    current_user: Optional[UserInfo] = Depends(require_manage_access),
+):
+    from cuga.backend.evolve.retention import (
+        DEFAULT_RETENTION_POLICY,
+        project_retention_report,
+        sanitize_retention_report,
+    )
+    from cuga.backend.evolve.retention_store import save_retention_run
+
+    run_id = str(uuid.uuid4())
+    result = _memory_result(
+        await EvolveIntegration.run_retention(
+            DEFAULT_RETENTION_POLICY,
+            dry_run=body.dry_run,
+            as_of=body.as_of,
+            scan_limit=body.scan_limit,
+            run_id=run_id,
+            namespace_id=_namespace_id(),
+            metadata_filters={"agent_id": agent_id},
+        )
+    )
+    sanitized = sanitize_retention_report({**result, "run_id": run_id, "dry_run": body.dry_run})
+    await save_retention_run(
+        run_id=run_id,
+        agent_id=agent_id,
+        actor_id=_user_id(current_user),
+        dry_run=body.dry_run,
+        report=sanitized,
+    )
+    return JSONResponse(project_retention_report(sanitized))
+
+
+@router.get("/manage/memory/retention/runs")
+async def list_admin_memory_retention_runs(
+    agent_id: str = Query(default="cuga-default", min_length=1, max_length=200),
+    limit: int = Query(default=50, ge=1, le=200),
+    current_user: Optional[UserInfo] = Depends(require_manage_access),
+):
+    from cuga.backend.evolve.retention import project_retention_report
+    from cuga.backend.evolve.retention_store import list_retention_runs
+
+    rows = await list_retention_runs(agent_id=agent_id, limit=limit)
+    return JSONResponse(
+        {
+            "items": [
+                {key: row[key] for key in ("run_id", "actor_id", "dry_run", "status", "created_at")}
+                | {"report": project_retention_report(row["report"])}
+                for row in rows
+            ]
+        }
+    )
+
+
+@router.get("/manage/memory/compliance/status")
+async def get_admin_memory_compliance_status(
+    current_user: Optional[UserInfo] = Depends(require_manage_access),
+):
+    from cuga.backend.evolve.retention import project_compliance_status
+
+    result = _memory_result(await EvolveIntegration.get_compliance_status(namespace_id=_namespace_id()))
+    return JSONResponse(project_compliance_status(result))
